@@ -1,18 +1,18 @@
-use super::{Error, Highlight, HighlightConfiguration, Highlighter, HtmlRenderer};
+use std::{
+    collections::HashMap, ffi::CStr, fmt, os::raw::c_char, process::abort, slice, str,
+    sync::atomic::AtomicUsize,
+};
+
 use regex::Regex;
-use std::collections::HashMap;
-use std::ffi::CStr;
-use std::os::raw::c_char;
-use std::process::abort;
-use std::sync::atomic::AtomicUsize;
-use std::{fmt, slice, str};
 use tree_sitter::Language;
 
+use super::{Error, Highlight, HighlightConfiguration, Highlighter, HtmlRenderer};
+
 pub struct TSHighlighter {
-    languages: HashMap<String, (Option<Regex>, HighlightConfiguration)>,
-    attribute_strings: Vec<&'static [u8]>,
-    highlight_names: Vec<String>,
-    carriage_return_index: Option<usize>,
+    pub languages: HashMap<String, (Option<Regex>, HighlightConfiguration)>,
+    pub attribute_strings: Vec<&'static [u8]>,
+    pub highlight_names: Vec<String>,
+    pub carriage_return_index: Option<usize>,
 }
 
 pub struct TSHighlightBuffer {
@@ -72,8 +72,8 @@ pub unsafe extern "C" fn ts_highlighter_new(
 /// `this` must be non-null and must be a valid pointer to a [`TSHighlighter`] instance
 /// created by [`ts_highlighter_new`].
 ///
-/// The caller must ensure that any `*const c_char` (C-style string) parameters are valid for the lifetime of
-/// the [`TSHighlighter`] instance, and are non-null.
+/// The caller must ensure that any `*const c_char` (C-style string) parameters are valid for the
+/// lifetime of the [`TSHighlighter`] instance, and are non-null.
 #[no_mangle]
 pub unsafe extern "C" fn ts_highlighter_add_language(
     this: *mut TSHighlighter,
@@ -87,7 +87,6 @@ pub unsafe extern "C" fn ts_highlighter_add_language(
     highlight_query_len: u32,
     injection_query_len: u32,
     locals_query_len: u32,
-    apply_all_captures: bool,
 ) -> ErrorCode {
     let f = move || {
         let this = unwrap_mut_ptr(this);
@@ -105,20 +104,20 @@ pub unsafe extern "C" fn ts_highlighter_add_language(
         };
 
         let highlight_query =
-            slice::from_raw_parts(highlight_query as *const u8, highlight_query_len as usize);
+            slice::from_raw_parts(highlight_query.cast::<u8>(), highlight_query_len as usize);
 
         let highlight_query = str::from_utf8(highlight_query).or(Err(ErrorCode::InvalidUtf8))?;
 
         let injection_query = if injection_query_len > 0 {
             let query =
-                slice::from_raw_parts(injection_query as *const u8, injection_query_len as usize);
+                slice::from_raw_parts(injection_query.cast::<u8>(), injection_query_len as usize);
             str::from_utf8(query).or(Err(ErrorCode::InvalidUtf8))?
         } else {
             ""
         };
 
         let locals_query = if locals_query_len > 0 {
-            let query = slice::from_raw_parts(locals_query as *const u8, locals_query_len as usize);
+            let query = slice::from_raw_parts(locals_query.cast::<u8>(), locals_query_len as usize);
             str::from_utf8(query).or(Err(ErrorCode::InvalidUtf8))?
         } else {
             ""
@@ -134,7 +133,6 @@ pub unsafe extern "C" fn ts_highlighter_add_language(
             highlight_query,
             injection_query,
             locals_query,
-            apply_all_captures,
         )
         .or(Err(ErrorCode::InvalidQuery))?;
         config.configure(this.highlight_names.as_slice());
@@ -167,7 +165,7 @@ pub extern "C" fn ts_highlight_buffer_new() -> *mut TSHighlightBuffer {
 /// It cannot be used after this function is called.
 #[no_mangle]
 pub unsafe extern "C" fn ts_highlighter_delete(this: *mut TSHighlighter) {
-    drop(Box::from_raw(this))
+    drop(Box::from_raw(this));
 }
 
 /// Deletes a [`TSHighlightBuffer`] instance.
@@ -180,7 +178,7 @@ pub unsafe extern "C" fn ts_highlighter_delete(this: *mut TSHighlighter) {
 /// It cannot be used after this function is called.
 #[no_mangle]
 pub unsafe extern "C" fn ts_highlight_buffer_delete(this: *mut TSHighlightBuffer) {
-    drop(Box::from_raw(this))
+    drop(Box::from_raw(this));
 }
 
 /// Get the HTML content of a [`TSHighlightBuffer`] instance as a raw pointer.
@@ -190,8 +188,8 @@ pub unsafe extern "C" fn ts_highlight_buffer_delete(this: *mut TSHighlightBuffer
 /// `this` must be non-null and must be a valid pointer to a [`TSHighlightBuffer`] instance
 /// created by [`ts_highlight_buffer_new`].
 ///
-/// The returned pointer, a C-style string, must not outlive the [`TSHighlightBuffer`] instance, else the
-/// data will point to garbage.
+/// The returned pointer, a C-style string, must not outlive the [`TSHighlightBuffer`] instance,
+/// else the data will point to garbage.
 ///
 /// To get the length of the HTML content, use [`ts_highlight_buffer_len`].
 #[no_mangle]
@@ -207,8 +205,8 @@ pub unsafe extern "C" fn ts_highlight_buffer_content(this: *const TSHighlightBuf
 /// `this` must be non-null and must be a valid pointer to a [`TSHighlightBuffer`] instance
 /// created by [`ts_highlight_buffer_new`].
 ///
-/// The returned pointer, a C-style array of [`u32`]s, must not outlive the [`TSHighlightBuffer`] instance, else the
-/// data will point to garbage.
+/// The returned pointer, a C-style array of [`u32`]s, must not outlive the [`TSHighlightBuffer`]
+/// instance, else the data will point to garbage.
 ///
 /// To get the length of the array, use [`ts_highlight_buffer_line_count`].
 #[no_mangle]
@@ -247,10 +245,11 @@ pub unsafe extern "C" fn ts_highlight_buffer_line_count(this: *const TSHighlight
 ///
 /// # Safety
 ///
-/// The caller must ensure that `scope_name`, `source_code`, `output`, and `cancellation_flag` are valid for
-/// the lifetime of the [`TSHighlighter`] instance, and are non-null.
+/// The caller must ensure that `scope_name`, `source_code`, `output`, and `cancellation_flag` are
+/// valid for the lifetime of the [`TSHighlighter`] instance, and are non-null.
 ///
-/// `this` must be a non-null pointer to a [`TSHighlighter`] instance created by [`ts_highlighter_new`]
+/// `this` must be a non-null pointer to a [`TSHighlighter`] instance created by
+/// [`ts_highlighter_new`]
 #[no_mangle]
 pub unsafe extern "C" fn ts_highlighter_highlight(
     this: *const TSHighlighter,
@@ -263,7 +262,7 @@ pub unsafe extern "C" fn ts_highlighter_highlight(
     let this = unwrap_ptr(this);
     let output = unwrap_mut_ptr(output);
     let scope_name = unwrap(CStr::from_ptr(scope_name).to_str());
-    let source_code = slice::from_raw_parts(source_code as *const u8, source_code_len as usize);
+    let source_code = slice::from_raw_parts(source_code.cast::<u8>(), source_code_len as usize);
     let cancellation_flag = cancellation_flag.as_ref();
     this.highlight(source_code, scope_name, output, cancellation_flag)
 }
@@ -305,11 +304,11 @@ impl TSHighlighter {
             output
                 .renderer
                 .set_carriage_return_highlight(self.carriage_return_index.map(Highlight));
-            let result = output
-                .renderer
-                .render(highlights, source_code, &|s| self.attribute_strings[s.0]);
+            let result = output.renderer.render(highlights, source_code, &|s, out| {
+                out.extend(self.attribute_strings[s.0]);
+            });
             match result {
-                Err(Error::Cancelled) | Err(Error::Unknown) => ErrorCode::Timeout,
+                Err(Error::Cancelled | Error::Unknown) => ErrorCode::Timeout,
                 Err(Error::InvalidLanguage) => ErrorCode::InvalidLanguage,
                 Ok(()) => ErrorCode::Ok,
             }
@@ -335,7 +334,7 @@ unsafe fn unwrap_mut_ptr<'a, T>(result: *mut T) -> &'a mut T {
 
 fn unwrap<T, E: fmt::Display>(result: Result<T, E>) -> T {
     result.unwrap_or_else(|error| {
-        eprintln!("tree-sitter highlight error: {}", error);
+        eprintln!("tree-sitter highlight error: {error}");
         abort();
     })
 }

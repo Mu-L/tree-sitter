@@ -12,7 +12,7 @@ Rust bindings to the [Tree-sitter][] parsing library.
 First, create a parser:
 
 ```rust
-use tree_sitter::{Parser, Language};
+use tree_sitter::{InputEdit, Language, Parser, Point};
 
 let mut parser = Parser::new();
 ```
@@ -28,21 +28,21 @@ Then, add a language as a dependency:
 
 ```toml
 [dependencies]
-tree-sitter = "0.20.10"
-tree-sitter-rust = "0.20.3"
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
 ```
 
 To then use a language, you assign them to the parser.
 
 ```rust
-parser.set_language(tree_sitter_rust::language()).expect("Error loading Rust grammar");
+parser.set_language(&tree_sitter_rust::LANGUAGE.into()).expect("Error loading Rust grammar");
 ```
 
 Now you can parse source code:
 
 ```rust
 let source_code = "fn test() {}";
-let tree = parser.parse(source_code, None).unwrap();
+let mut tree = parser.parse(source_code, None).unwrap();
 let root_node = tree.root_node();
 
 assert_eq!(root_node.kind(), "source_file");
@@ -56,9 +56,9 @@ Once you have a syntax tree, you can update it when your source code changes.
 Passing in the previous edited tree makes `parse` run much more quickly:
 
 ```rust
-let new_source_code = "fn test(a: u32) {}"
+let new_source_code = "fn test(a: u32) {}";
 
-tree.edit(InputEdit {
+tree.edit(&InputEdit {
   start_byte: 8,
   old_end_byte: 8,
   new_end_byte: 14,
@@ -85,14 +85,14 @@ let lines = &[
 
 // Parse the source code using a custom callback. The callback is called
 // with both a byte offset and a row/column offset.
-let tree = parser.parse_with(&mut |_byte: u32, position: Point| -> &[u8] {
+let tree = parser.parse_with(&mut |_byte: usize, position: Point| -> &[u8] {
     let row = position.row as usize;
     let column = position.column as usize;
     if row < lines.len() {
         if column < lines[row].as_bytes().len() {
             &lines[row].as_bytes()[column..]
         } else {
-            "\n".as_bytes()
+            b"\n"
         }
     } else {
         &[]
@@ -106,3 +106,11 @@ assert_eq!(
 ```
 
 [tree-sitter]: https://github.com/tree-sitter/tree-sitter
+
+## Features
+
+- **std** - This feature is enabled by default and allows `tree-sitter` to use the standard library.
+  - Error types implement the `std::error:Error` trait.
+  - `regex` performance optimizations are enabled.
+  - The DOT graph methods are enabled.
+- **wasm** - This feature allows `tree-sitter` to be built for Wasm targets using the `wasmtime-c-api` crate.

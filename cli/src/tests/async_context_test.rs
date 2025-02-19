@@ -1,9 +1,13 @@
-use super::helpers::fixtures::get_language;
-use std::future::Future;
-use std::pin::{pin, Pin};
-use std::ptr;
-use std::task::{self, Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::{
+    future::Future,
+    pin::{pin, Pin},
+    ptr,
+    task::{self, Context, Poll, RawWaker, RawWakerVTable, Waker},
+};
+
 use tree_sitter::Parser;
+
+use super::helpers::fixtures::get_language;
 
 #[test]
 fn test_node_in_fut() {
@@ -18,7 +22,6 @@ fn test_node_in_fut() {
         let root_ref = &root;
 
         let fut_val_fn = || async {
-            // eprintln!("fut_val_fn: {}", root.child(0).unwrap().kind());
             yield_now().await;
             root.child(0).unwrap().kind()
         };
@@ -26,7 +29,6 @@ fn test_node_in_fut() {
         yield_now().await;
 
         let fut_ref_fn = || async {
-            // eprintln!("fut_ref_fn: {}", root_ref.child(0).unwrap().kind());
             yield_now().await;
             root_ref.child(0).unwrap().kind()
         };
@@ -36,13 +38,11 @@ fn test_node_in_fut() {
         assert_eq!(f1, f2);
 
         let fut_val = async {
-            // eprintln!("fut_val: {}", root.child(0).unwrap().kind());
             yield_now().await;
             root.child(0).unwrap().kind()
         };
 
         let fut_ref = async {
-            // eprintln!("fut_ref: {}", root_ref.child(0).unwrap().kind());
             yield_now().await;
             root_ref.child(0).unwrap().kind()
         };
@@ -54,16 +54,15 @@ fn test_node_in_fut() {
         f1
     })
     .join();
-    // eprintln!("pended: {pended:?}");
     assert_eq!(ret, "comment");
     assert_eq!(pended, 5);
 }
 
 #[test]
 fn test_node_and_cursor_ref_in_fut() {
-    let (_, pended) = tokio_like_spawn(async {
+    let ((), pended) = tokio_like_spawn(async {
         let mut parser = Parser::new();
-        let language = get_language("bash");
+        let language = get_language("c");
         parser.set_language(&language).unwrap();
 
         let tree = parser.parse("#", None).unwrap();
@@ -78,14 +77,14 @@ fn test_node_and_cursor_ref_in_fut() {
 
         let fut_val = async {
             yield_now().await;
-            root.to_sexp();
+            let _ = root.to_sexp();
         };
 
         yield_now().await;
 
         let fut_ref = async {
             yield_now().await;
-            root_ref.to_sexp();
+            let _ = root_ref.to_sexp();
             cursor_ref.goto_first_child();
         };
 
@@ -100,9 +99,9 @@ fn test_node_and_cursor_ref_in_fut() {
 
 #[test]
 fn test_node_and_cursor_ref_in_fut_with_fut_fabrics() {
-    let (_, pended) = tokio_like_spawn(async {
+    let ((), pended) = tokio_like_spawn(async {
         let mut parser = Parser::new();
-        let language = get_language("bash");
+        let language = get_language("javascript");
         parser.set_language(&language).unwrap();
 
         let tree = parser.parse("#", None).unwrap();
@@ -117,14 +116,14 @@ fn test_node_and_cursor_ref_in_fut_with_fut_fabrics() {
 
         let fut_val = || async {
             yield_now().await;
-            root.to_sexp();
+            let _ = root.to_sexp();
         };
 
         yield_now().await;
 
         let fut_ref = || async move {
             yield_now().await;
-            root_ref.to_sexp();
+            let _ = root_ref.to_sexp();
             cursor_ref.goto_first_child();
         };
 
@@ -140,7 +139,7 @@ fn test_node_and_cursor_ref_in_fut_with_fut_fabrics() {
 fn test_node_and_cursor_ref_in_fut_with_inner_spawns() {
     let (ret, pended) = tokio_like_spawn(async {
         let mut parser = Parser::new();
-        let language = get_language("bash");
+        let language = get_language("rust");
         parser.set_language(&language).unwrap();
 
         let tree = parser.parse("#", None).unwrap();
@@ -157,7 +156,7 @@ fn test_node_and_cursor_ref_in_fut_with_inner_spawns() {
                 let mut cursor = tree.walk();
                 let cursor_ref = &mut cursor;
                 yield_now().await;
-                root.to_sexp();
+                let _ = root.to_sexp();
                 cursor_ref.goto_first_child();
             }
         };
@@ -172,13 +171,13 @@ fn test_node_and_cursor_ref_in_fut_with_inner_spawns() {
                 let mut cursor = tree.walk();
                 let cursor_ref = &mut cursor;
                 yield_now().await;
-                root_ref.to_sexp();
+                let _ = root_ref.to_sexp();
                 cursor_ref.goto_first_child();
             }
         };
 
-        let (_, p1) = tokio_like_spawn(fut_val()).await.unwrap();
-        let (_, p2) = tokio_like_spawn(fut_ref()).await.unwrap();
+        let ((), p1) = tokio_like_spawn(fut_val()).await.unwrap();
+        let ((), p2) = tokio_like_spawn(fut_ref()).await.unwrap();
 
         cursor_ref.goto_first_child();
 
@@ -211,7 +210,6 @@ where
         match future.as_mut().poll(&mut cx) {
             Poll::Pending => pending += 1,
             Poll::Ready(r) => {
-                // eprintln!("ready, pended: {pending}");
                 break r;
             }
         }
@@ -228,7 +226,7 @@ async fn yield_now() {
         type Output = ();
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            cx.waker().clone().wake();
+            cx.waker().wake_by_ref();
             if self.yielded {
                 return Poll::Ready(());
             }
@@ -237,7 +235,7 @@ async fn yield_now() {
         }
     }
 
-    SimpleYieldNow { yielded: false }.await
+    SimpleYieldNow { yielded: false }.await;
 }
 
 pub fn noop_waker() -> Waker {
@@ -260,7 +258,8 @@ struct JoinHandle<T> {
 }
 
 impl<T> JoinHandle<T> {
-    fn new(data: T) -> Self {
+    #[must_use]
+    const fn new(data: T) -> Self {
         Self { data: Some(data) }
     }
 

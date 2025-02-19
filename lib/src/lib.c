@@ -1,5 +1,3 @@
-#define _POSIX_C_SOURCE 200112L
-
 #include "./alloc.c"
 #include "./get_changed_ranges.c"
 #include "./language.c"
@@ -11,4 +9,4 @@
 #include "./subtree.c"
 #include "./tree_cursor.c"
 #include "./tree.c"
-#include "./wasm.c"
+#include "./wasm_store.c"

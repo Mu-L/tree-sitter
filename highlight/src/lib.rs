@@ -1,25 +1,33 @@
 #![doc = include_str!("../README.md")]
 
 pub mod c_lib;
-pub mod util;
-pub use c_lib as c;
+use core::slice;
+use std::{
+    collections::HashSet,
+    iter,
+    marker::PhantomData,
+    mem::{self, MaybeUninit},
+    ops, str,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        LazyLock,
+    },
+};
 
-use lazy_static::lazy_static;
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{iter, mem, ops, str, usize};
+pub use c_lib as c;
+use streaming_iterator::StreamingIterator;
 use thiserror::Error;
 use tree_sitter::{
-    Language, LossyUtf8, Node, Parser, Point, Query, QueryCaptures, QueryCursor, QueryError,
-    QueryMatch, Range, Tree,
+    ffi, Language, LossyUtf8, Node, ParseOptions, Parser, Point, Query, QueryCapture,
+    QueryCaptures, QueryCursor, QueryError, QueryMatch, Range, TextProvider, Tree,
 };
 
 const CANCELLATION_CHECK_INTERVAL: usize = 100;
 const BUFFER_HTML_RESERVE_CAPACITY: usize = 10 * 1024;
 const BUFFER_LINES_RESERVE_CAPACITY: usize = 1000;
 
-lazy_static! {
-    static ref STANDARD_CAPTURE_NAMES: HashSet<&'static str> = vec![
+static STANDARD_CAPTURE_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    vec![
         "attribute",
         "boolean",
         "carriage-return",
@@ -74,8 +82,8 @@ lazy_static! {
         "variable.parameter",
     ]
     .into_iter()
-    .collect();
-}
+    .collect()
+});
 
 /// Indicates which highlight should be applied to a region of source code.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -107,7 +115,6 @@ pub struct HighlightConfiguration {
     pub language: Language,
     pub language_name: String,
     pub query: Query,
-    pub apply_all_captures: bool,
     combined_injections_query: Option<Query>,
     locals_pattern_index: usize,
     highlights_pattern_index: usize,
@@ -166,13 +173,12 @@ where
     iter_count: usize,
     next_event: Option<HighlightEvent>,
     last_highlight_range: Option<(usize, usize, usize)>,
-    apply_all_captures: bool,
 }
 
 struct HighlightIterLayer<'a> {
     _tree: Tree,
     cursor: QueryCursor,
-    captures: iter::Peekable<QueryCaptures<'a, 'a, &'a [u8], &'a [u8]>>,
+    captures: iter::Peekable<_QueryCaptures<'a, 'a, &'a [u8], &'a [u8]>>,
     config: &'a HighlightConfiguration,
     highlight_end_stack: Vec<usize>,
     scope_stack: Vec<LocalScope<'a>>,
@@ -180,9 +186,88 @@ struct HighlightIterLayer<'a> {
     depth: usize,
 }
 
+pub struct _QueryCaptures<'query, 'tree: 'query, T: TextProvider<I>, I: AsRef<[u8]>> {
+    ptr: *mut ffi::TSQueryCursor,
+    query: &'query Query,
+    text_provider: T,
+    buffer1: Vec<u8>,
+    buffer2: Vec<u8>,
+    _current_match: Option<(QueryMatch<'query, 'tree>, usize)>,
+    _options: Option<*mut ffi::TSQueryCursorOptions>,
+    _phantom: PhantomData<(&'tree (), I)>,
+}
+
+struct _QueryMatch<'cursor, 'tree> {
+    pub _pattern_index: usize,
+    pub _captures: &'cursor [QueryCapture<'tree>],
+    _id: u32,
+    _cursor: *mut ffi::TSQueryCursor,
+}
+
+impl<'tree> _QueryMatch<'_, 'tree> {
+    fn new(m: &ffi::TSQueryMatch, cursor: *mut ffi::TSQueryCursor) -> Self {
+        _QueryMatch {
+            _cursor: cursor,
+            _id: m.id,
+            _pattern_index: m.pattern_index as usize,
+            _captures: (m.capture_count > 0)
+                .then(|| unsafe {
+                    slice::from_raw_parts(
+                        m.captures.cast::<QueryCapture<'tree>>(),
+                        m.capture_count as usize,
+                    )
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl<'query, 'tree: 'query, T: TextProvider<I>, I: AsRef<[u8]>> Iterator
+    for _QueryCaptures<'query, 'tree, T, I>
+{
+    type Item = (QueryMatch<'query, 'tree>, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        unsafe {
+            loop {
+                let mut capture_index = 0u32;
+                let mut m = MaybeUninit::<ffi::TSQueryMatch>::uninit();
+                if ffi::ts_query_cursor_next_capture(
+                    self.ptr,
+                    m.as_mut_ptr(),
+                    core::ptr::addr_of_mut!(capture_index),
+                ) {
+                    let result = std::mem::transmute::<_QueryMatch, QueryMatch>(_QueryMatch::new(
+                        &m.assume_init(),
+                        self.ptr,
+                    ));
+                    if result.satisfies_text_predicates(
+                        self.query,
+                        &mut self.buffer1,
+                        &mut self.buffer2,
+                        &mut self.text_provider,
+                    ) {
+                        return Some((result, capture_index as usize));
+                    }
+                    result.remove();
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+impl Default for Highlighter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Highlighter {
+    #[must_use]
     pub fn new() -> Self {
-        Highlighter {
+        Self {
             parser: Parser::new(),
             cursors: Vec::new(),
         }
@@ -227,7 +312,6 @@ impl Highlighter {
             layers,
             next_event: None,
             last_highlight_range: None,
-            apply_all_captures: config.apply_all_captures,
         };
         result.sort_layers();
         Ok(result)
@@ -243,10 +327,10 @@ impl HighlightConfiguration {
     /// * `language`  - The Tree-sitter `Language` that should be used for parsing.
     /// * `highlights_query` - A string containing tree patterns for syntax highlighting. This
     ///   should be non-empty, otherwise no syntax highlights will be added.
-    /// * `injections_query` -  A string containing tree patterns for injecting other languages
-    ///   into the document. This can be empty if no injections are desired.
-    /// * `locals_query` - A string containing tree patterns for tracking local variable
-    ///   definitions and references. This can be empty if local variable tracking is not needed.
+    /// * `injections_query` -  A string containing tree patterns for injecting other languages into
+    ///   the document. This can be empty if no injections are desired.
+    /// * `locals_query` - A string containing tree patterns for tracking local variable definitions
+    ///   and references. This can be empty if local variable tracking is not needed.
     ///
     /// Returns a `HighlightConfiguration` that can then be used with the `highlight` method.
     pub fn new(
@@ -255,7 +339,6 @@ impl HighlightConfiguration {
         highlights_query: &str,
         injection_query: &str,
         locals_query: &str,
-        apply_all_captures: bool,
     ) -> Result<Self, QueryError> {
         // Concatenate the query strings, keeping track of the start offset of each section.
         let mut query_source = String::new();
@@ -333,11 +416,10 @@ impl HighlightConfiguration {
         }
 
         let highlight_indices = vec![None; query.capture_names().len()];
-        Ok(HighlightConfiguration {
+        Ok(Self {
             language,
             language_name: name.into(),
             query,
-            apply_all_captures,
             combined_injections_query,
             locals_pattern_index,
             highlights_pattern_index,
@@ -353,7 +435,8 @@ impl HighlightConfiguration {
     }
 
     /// Get a slice containing all of the highlight names used in the configuration.
-    pub fn names(&self) -> &[&str] {
+    #[must_use]
+    pub const fn names(&self) -> &[&str] {
         self.query.capture_names()
     }
 
@@ -377,7 +460,7 @@ impl HighlightConfiguration {
 
                 let mut best_index = None;
                 let mut best_match_len = 0;
-                for (i, recognized_name) in recognized_names.into_iter().enumerate() {
+                for (i, recognized_name) in recognized_names.iter().enumerate() {
                     let mut len = 0;
                     let mut matches = true;
                     for part in recognized_name.as_ref().split('.') {
@@ -397,18 +480,19 @@ impl HighlightConfiguration {
     }
 
     // Return the list of this configuration's capture names that are neither present in the
-    // list of predefined 'canonical' names nor start with an underscore (denoting 'private' captures
-    // used as part of capture internals).
+    // list of predefined 'canonical' names nor start with an underscore (denoting 'private'
+    // captures used as part of capture internals).
+    #[must_use]
     pub fn nonconformant_capture_names(&self, capture_names: &HashSet<&str>) -> Vec<&str> {
         let capture_names = if capture_names.is_empty() {
             &*STANDARD_CAPTURE_NAMES
         } else {
-            &capture_names
+            capture_names
         };
         self.names()
             .iter()
             .filter(|&n| !(n.starts_with('_') || capture_names.contains(n)))
-            .map(|n| *n)
+            .copied()
             .collect()
     }
 }
@@ -416,9 +500,10 @@ impl HighlightConfiguration {
 impl<'a> HighlightIterLayer<'a> {
     /// Create a new 'layer' of highlighting for this document.
     ///
-    /// In the even that the new layer contains "combined injections" (injections where multiple
+    /// In the event that the new layer contains "combined injections" (injections where multiple
     /// disjoint ranges are parsed as one syntax tree), these will be eagerly processed and
     /// added to the returned vector.
+    #[allow(clippy::too_many_arguments)]
     fn new<F: FnMut(&str) -> Option<&'a HighlightConfiguration> + 'a>(
         source: &'a [u8],
         parent_name: Option<&str>,
@@ -438,27 +523,41 @@ impl<'a> HighlightIterLayer<'a> {
                     .set_language(&config.language)
                     .map_err(|_| Error::InvalidLanguage)?;
 
-                unsafe { highlighter.parser.set_cancellation_flag(cancellation_flag) };
                 let tree = highlighter
                     .parser
-                    .parse(source, None)
+                    .parse_with_options(
+                        &mut |i, _| {
+                            if i < source.len() {
+                                &source[i..]
+                            } else {
+                                &[]
+                            }
+                        },
+                        None,
+                        Some(ParseOptions::new().progress_callback(&mut |_| {
+                            if let Some(cancellation_flag) = cancellation_flag {
+                                cancellation_flag.load(Ordering::SeqCst) != 0
+                            } else {
+                                false
+                            }
+                        })),
+                    )
                     .ok_or(Error::Cancelled)?;
-                unsafe { highlighter.parser.set_cancellation_flag(None) };
-                let mut cursor = highlighter.cursors.pop().unwrap_or(QueryCursor::new());
+                let mut cursor = highlighter.cursors.pop().unwrap_or_default();
 
                 // Process combined injections.
                 if let Some(combined_injections_query) = &config.combined_injections_query {
                     let mut injections_by_pattern_index =
                         vec![(None, Vec::new(), false); combined_injections_query.pattern_count()];
-                    let matches =
+                    let mut matches =
                         cursor.matches(combined_injections_query, tree.root_node(), source);
-                    for mat in matches {
+                    while let Some(mat) = matches.next() {
                         let entry = &mut injections_by_pattern_index[mat.pattern_index];
                         let (language_name, content_node, include_children) = injection_for_match(
                             config,
                             parent_name,
                             combined_injections_query,
-                            &mat,
+                            mat,
                             source,
                         );
                         if language_name.is_some() {
@@ -489,12 +588,16 @@ impl<'a> HighlightIterLayer<'a> {
                 // The `captures` iterator borrows the `Tree` and the `QueryCursor`, which
                 // prevents them from being moved. But both of these values are really just
                 // pointers, so it's actually ok to move them.
-                let tree_ref = unsafe { mem::transmute::<_, &'static Tree>(&tree) };
-                let cursor_ref =
-                    unsafe { mem::transmute::<_, &'static mut QueryCursor>(&mut cursor) };
-                let captures = cursor_ref
-                    .captures(&config.query, tree_ref.root_node(), source)
-                    .peekable();
+                let tree_ref = unsafe { mem::transmute::<&Tree, &'static Tree>(&tree) };
+                let cursor_ref = unsafe {
+                    mem::transmute::<&mut QueryCursor, &'static mut QueryCursor>(&mut cursor)
+                };
+                let captures = unsafe {
+                    std::mem::transmute::<QueryCaptures<_, _>, _QueryCaptures<_, _>>(
+                        cursor_ref.captures(&config.query, tree_ref.root_node(), source),
+                    )
+                }
+                .peekable();
 
                 result.push(HighlightIterLayer {
                     highlight_end_stack: Vec::new(),
@@ -514,12 +617,12 @@ impl<'a> HighlightIterLayer<'a> {
 
             if queue.is_empty() {
                 break;
-            } else {
-                let (next_config, next_depth, next_ranges) = queue.remove(0);
-                config = next_config;
-                depth = next_depth;
-                ranges = next_ranges;
             }
+
+            let (next_config, next_depth, next_ranges) = queue.remove(0);
+            config = next_config;
+            depth = next_depth;
+            ranges = next_ranges;
         }
 
         Ok(result)
@@ -528,12 +631,12 @@ impl<'a> HighlightIterLayer<'a> {
     // Compute the ranges that should be included when parsing an injection.
     // This takes into account three things:
     // * `parent_ranges` - The ranges must all fall within the *current* layer's ranges.
-    // * `nodes` - Every injection takes place within a set of nodes. The injection ranges
-    //   are the ranges of those nodes.
-    // * `includes_children` - For some injections, the content nodes' children should be
-    //   excluded from the nested document, so that only the content nodes' *own* content
-    //   is reparsed. For other injections, the content nodes' entire ranges should be
-    //   reparsed, including the ranges of their children.
+    // * `nodes` - Every injection takes place within a set of nodes. The injection ranges are the
+    //   ranges of those nodes.
+    // * `includes_children` - For some injections, the content nodes' children should be excluded
+    //   from the nested document, so that only the content nodes' *own* content is reparsed. For
+    //   other injections, the content nodes' entire ranges should be reparsed, including the ranges
+    //   of their children.
     fn intersect_ranges(
         parent_ranges: &[Range],
         nodes: &[Node],
@@ -545,7 +648,7 @@ impl<'a> HighlightIterLayer<'a> {
         let mut parent_range = parent_range_iter
             .next()
             .expect("Layers should only be constructed with non-empty ranges vectors");
-        for node in nodes.iter() {
+        for node in nodes {
             let mut preceding_range = Range {
                 start_byte: 0,
                 start_point: Point::new(0, 0),
@@ -568,7 +671,7 @@ impl<'a> HighlightIterLayer<'a> {
                         Some(child.range())
                     }
                 })
-                .chain([following_range].iter().cloned())
+                .chain(std::iter::once(following_range))
             {
                 let mut range = Range {
                     start_byte: preceding_range.end_byte,
@@ -628,7 +731,7 @@ impl<'a> HighlightIterLayer<'a> {
             .captures
             .peek()
             .map(|(m, i)| m.captures[*i].node.start_byte());
-        let next_end = self.highlight_end_stack.last().cloned();
+        let next_end = self.highlight_end_stack.last().copied();
         match (next_start, next_end) {
             (Some(start), Some(end)) => {
                 if start < end {
@@ -682,13 +785,12 @@ where
                     break;
                 }
                 if i > 0 {
-                    self.layers[0..(i + 1)].rotate_left(1);
+                    self.layers[0..=i].rotate_left(1);
                 }
                 break;
-            } else {
-                let layer = self.layers.remove(0);
-                self.highlighter.cursors.push(layer.cursor);
             }
+            let layer = self.layers.remove(0);
+            self.highlighter.cursors.push(layer.cursor);
         }
     }
 
@@ -760,7 +862,7 @@ where
                 // If any previous highlight ends before this node starts, then before
                 // processing this capture, emit the source code up until the end of the
                 // previous highlight, and an end event for that highlight.
-                if let Some(end_byte) = layer.highlight_end_stack.last().cloned() {
+                if let Some(end_byte) = layer.highlight_end_stack.last().copied() {
                     if end_byte <= range.start {
                         layer.highlight_end_stack.pop();
                         return self.emit_event(end_byte, Some(HighlightEvent::HighlightEnd));
@@ -769,12 +871,13 @@ where
             }
             // If there are no more captures, then emit any remaining highlight end events.
             // And if there are none of those, then just advance to the end of the document.
-            else if let Some(end_byte) = layer.highlight_end_stack.last().cloned() {
-                layer.highlight_end_stack.pop();
-                return self.emit_event(end_byte, Some(HighlightEvent::HighlightEnd));
-            } else {
+            else {
+                if let Some(end_byte) = layer.highlight_end_stack.last().copied() {
+                    layer.highlight_end_stack.pop();
+                    return self.emit_event(end_byte, Some(HighlightEvent::HighlightEnd));
+                }
                 return self.emit_event(self.source.len(), None);
-            };
+            }
 
             let (mut match_, capture_index) = layer.captures.next().unwrap();
             let mut capture = match_.captures[capture_index];
@@ -848,12 +951,9 @@ where
                         local_defs: Vec::new(),
                     };
                     for prop in layer.config.query.property_settings(match_.pattern_index) {
-                        match prop.key.as_ref() {
-                            "local.scope-inherits" => {
-                                scope.inherits =
-                                    prop.value.as_ref().map_or(true, |r| r.as_ref() == "true");
-                            }
-                            _ => {}
+                        if prop.key.as_ref() == "local.scope-inherits" {
+                            scope.inherits =
+                                prop.value.as_ref().is_none_or(|r| r.as_ref() == "true");
                         }
                     }
                     layer.scope_stack.push(scope);
@@ -884,26 +984,24 @@ where
                 }
                 // If the node represents a reference, then try to find the corresponding
                 // definition in the scope stack.
-                else if Some(capture.index) == layer.config.local_ref_capture_index {
-                    if definition_highlight.is_none() {
-                        definition_highlight = None;
-                        if let Ok(name) = str::from_utf8(&self.source[range.clone()]) {
-                            for scope in layer.scope_stack.iter().rev() {
-                                if let Some(highlight) =
-                                    scope.local_defs.iter().rev().find_map(|def| {
-                                        if def.name == name && range.start >= def.value_range.end {
-                                            Some(def.highlight)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                {
-                                    reference_highlight = highlight;
-                                    break;
+                else if Some(capture.index) == layer.config.local_ref_capture_index
+                    && definition_highlight.is_none()
+                {
+                    definition_highlight = None;
+                    if let Ok(name) = str::from_utf8(&self.source[range.clone()]) {
+                        for scope in layer.scope_stack.iter().rev() {
+                            if let Some(highlight) = scope.local_defs.iter().rev().find_map(|def| {
+                                if def.name == name && range.start >= def.value_range.end {
+                                    Some(def.highlight)
+                                } else {
+                                    None
                                 }
-                                if !scope.inherits {
-                                    break;
-                                }
+                            }) {
+                                reference_highlight = highlight;
+                                break;
+                            }
+                            if !scope.inherits {
+                                break;
                             }
                         }
                     }
@@ -933,40 +1031,26 @@ where
                 }
             }
 
-            // If the current node was found to be a local variable, then skip over any
-            // highlighting patterns that are disabled for local variables.
-            if definition_highlight.is_some() || reference_highlight.is_some() {
-                while layer.config.non_local_variable_patterns[match_.pattern_index] {
-                    match_.remove();
-                    if let Some((next_match, next_capture_index)) = layer.captures.peek() {
-                        let next_capture = next_match.captures[*next_capture_index];
-                        if next_capture.node == capture.node {
-                            capture = next_capture;
-                            match_ = layer.captures.next().unwrap().0;
-                            continue;
-                        }
-                    }
-
-                    self.sort_layers();
-                    continue 'main;
-                }
-            }
-
-            // Once a highlighting pattern is found for the current node, skip over
-            // any later highlighting patterns that also match this node. Captures
-            // for a given node are ordered by pattern index, so these subsequent
+            // Once a highlighting pattern is found for the current node, keep iterating over
+            // any later highlighting patterns that also match this node and set the match to it.
+            // Captures for a given node are ordered by pattern index, so these subsequent
             // captures are guaranteed to be for highlighting, not injections or
             // local variables.
             while let Some((next_match, next_capture_index)) = layer.captures.peek() {
                 let next_capture = next_match.captures[*next_capture_index];
                 if next_capture.node == capture.node {
-                    if self.apply_all_captures {
-                        match_.remove();
-                        capture = next_capture;
-                        match_ = layer.captures.next().unwrap().0;
-                    } else {
-                        layer.captures.next();
+                    let following_match = layer.captures.next().unwrap().0;
+                    // If the current node was found to be a local variable, then ignore
+                    // the following match if it's a highlighting pattern that is disabled
+                    // for local variables.
+                    if (definition_highlight.is_some() || reference_highlight.is_some())
+                        && layer.config.non_local_variable_patterns[following_match.pattern_index]
+                    {
+                        continue;
                     }
+                    match_.remove();
+                    capture = next_capture;
+                    match_ = following_match;
                 } else {
                     break;
                 }
@@ -993,9 +1077,16 @@ where
     }
 }
 
+impl Default for HtmlRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HtmlRenderer {
+    #[must_use]
     pub fn new() -> Self {
-        let mut result = HtmlRenderer {
+        let mut result = Self {
             html: Vec::with_capacity(BUFFER_HTML_RESERVE_CAPACITY),
             line_offsets: Vec::with_capacity(BUFFER_LINES_RESERVE_CAPACITY),
             carriage_return_highlight: None,
@@ -1014,28 +1105,28 @@ impl HtmlRenderer {
         self.line_offsets.push(0);
     }
 
-    pub fn render<'a, F>(
+    pub fn render<F>(
         &mut self,
         highlighter: impl Iterator<Item = Result<HighlightEvent, Error>>,
-        source: &'a [u8],
+        source: &[u8],
         attribute_callback: &F,
     ) -> Result<(), Error>
     where
-        F: Fn(Highlight) -> &'a [u8],
+        F: Fn(Highlight, &mut Vec<u8>),
     {
         let mut highlights = Vec::new();
         for event in highlighter {
             match event {
                 Ok(HighlightEvent::HighlightStart(s)) => {
                     highlights.push(s);
-                    self.start_highlight(s, attribute_callback);
+                    self.start_highlight(s, &attribute_callback);
                 }
                 Ok(HighlightEvent::HighlightEnd) => {
                     highlights.pop();
                     self.end_highlight();
                 }
                 Ok(HighlightEvent::Source { start, end }) => {
-                    self.add_text(&source[start..end], &highlights, attribute_callback);
+                    self.add_text(&source[start..end], &highlights, &attribute_callback);
                 }
                 Err(a) => return Err(a),
             }
@@ -1064,30 +1155,23 @@ impl HtmlRenderer {
             })
     }
 
-    fn add_carriage_return<'a, F>(&mut self, attribute_callback: &F)
+    fn add_carriage_return<F>(&mut self, attribute_callback: &F)
     where
-        F: Fn(Highlight) -> &'a [u8],
+        F: Fn(Highlight, &mut Vec<u8>),
     {
         if let Some(highlight) = self.carriage_return_highlight {
-            let attribute_string = (attribute_callback)(highlight);
-            if !attribute_string.is_empty() {
-                self.html.extend(b"<span ");
-                self.html.extend(attribute_string);
-                self.html.extend(b"></span>");
-            }
+            self.html.extend(b"<span ");
+            (attribute_callback)(highlight, &mut self.html);
+            self.html.extend(b"></span>");
         }
     }
 
-    fn start_highlight<'a, F>(&mut self, h: Highlight, attribute_callback: &F)
+    fn start_highlight<F>(&mut self, h: Highlight, attribute_callback: &F)
     where
-        F: Fn(Highlight) -> &'a [u8],
+        F: Fn(Highlight, &mut Vec<u8>),
     {
-        let attribute_string = (attribute_callback)(h);
-        self.html.extend(b"<span");
-        if !attribute_string.is_empty() {
-            self.html.extend(b" ");
-            self.html.extend(attribute_string);
-        }
+        self.html.extend(b"<span ");
+        (attribute_callback)(h, &mut self.html);
         self.html.extend(b">");
     }
 
@@ -1095,10 +1179,21 @@ impl HtmlRenderer {
         self.html.extend(b"</span>");
     }
 
-    fn add_text<'a, F>(&mut self, src: &[u8], highlights: &Vec<Highlight>, attribute_callback: &F)
+    fn add_text<F>(&mut self, src: &[u8], highlights: &[Highlight], attribute_callback: &F)
     where
-        F: Fn(Highlight) -> &'a [u8],
+        F: Fn(Highlight, &mut Vec<u8>),
     {
+        pub const fn html_escape(c: u8) -> Option<&'static [u8]> {
+            match c as char {
+                '>' => Some(b"&gt;"),
+                '<' => Some(b"&lt;"),
+                '&' => Some(b"&amp;"),
+                '\'' => Some(b"&#39;"),
+                '"' => Some(b"&quot;"),
+                _ => None,
+            }
+        }
+
         let mut last_char_was_cr = false;
         for c in LossyUtf8::new(src).flat_map(|p| p.bytes()) {
             // Don't render carriage return characters, but allow lone carriage returns (not
@@ -1122,7 +1217,7 @@ impl HtmlRenderer {
                 highlights
                     .iter()
                     .for_each(|scope| self.start_highlight(*scope, attribute_callback));
-            } else if let Some(escape) = util::html_escape(c) {
+            } else if let Some(escape) = html_escape(c) {
                 self.html.extend_from_slice(escape);
             } else {
                 self.html.push(c);
@@ -1161,7 +1256,7 @@ fn injection_for_match<'a>(
             // that sets the injection.language key.
             "injection.language" => {
                 if language_name.is_none() {
-                    language_name = prop.value.as_ref().map(|s| s.as_ref());
+                    language_name = prop.value.as_ref().map(std::convert::AsRef::as_ref);
                 }
             }
 

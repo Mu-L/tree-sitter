@@ -100,8 +100,8 @@ TSRange *ts_tree_included_ranges(const TSTree *self, uint32_t *length) {
 }
 
 TSRange *ts_tree_get_changed_ranges(const TSTree *old_tree, const TSTree *new_tree, uint32_t *length) {
-  TreeCursor cursor1 = {NULL, array_new()};
-  TreeCursor cursor2 = {NULL, array_new()};
+  TreeCursor cursor1 = {NULL, array_new(), 0};
+  TreeCursor cursor2 = {NULL, array_new(), 0};
   ts_tree_cursor_init(&cursor1, ts_tree_root_node(old_tree));
   ts_tree_cursor_init(&cursor2, ts_tree_root_node(new_tree));
 
@@ -126,19 +126,45 @@ TSRange *ts_tree_get_changed_ranges(const TSTree *old_tree, const TSTree *new_tr
 
 #ifdef _WIN32
 
+#include <io.h>
+#include <windows.h>
+
+int _ts_dup(HANDLE handle) {
+  HANDLE dup_handle;
+  if (!DuplicateHandle(
+    GetCurrentProcess(), handle,
+    GetCurrentProcess(), &dup_handle,
+    0, FALSE, DUPLICATE_SAME_ACCESS
+  )) return -1;
+
+  return _open_osfhandle((intptr_t)dup_handle, 0);
+}
+
 void ts_tree_print_dot_graph(const TSTree *self, int fd) {
-  (void)self;
-  (void)fd;
+  FILE *file = _fdopen(_ts_dup((HANDLE)_get_osfhandle(fd)), "a");
+  ts_subtree_print_dot_graph(self->root, self->language, file);
+  fclose(file);
+}
+
+#elif !defined(__wasi__) // WASI doesn't support dup
+
+#include <unistd.h>
+
+int _ts_dup(int file_descriptor) {
+  return dup(file_descriptor);
+}
+
+void ts_tree_print_dot_graph(const TSTree *self, int file_descriptor) {
+  FILE *file = fdopen(_ts_dup(file_descriptor), "a");
+  ts_subtree_print_dot_graph(self->root, self->language, file);
+  fclose(file);
 }
 
 #else
 
-#include <unistd.h>
-
 void ts_tree_print_dot_graph(const TSTree *self, int file_descriptor) {
-  FILE *file = fdopen(dup(file_descriptor), "a");
-  ts_subtree_print_dot_graph(self->root, self->language, file);
-  fclose(file);
+  (void)self;
+  (void)file_descriptor;
 }
 
 #endif

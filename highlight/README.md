@@ -5,14 +5,15 @@
 [crates.io]: https://crates.io/crates/tree-sitter-highlight
 [crates.io badge]: https://img.shields.io/crates/v/tree-sitter-highlight.svg?color=%23B48723
 
-### Usage
+## Usage
 
-Add this crate, and the language-specific crates for whichever languages you want to parse, to your `Cargo.toml`:
+Add this crate, and the language-specific crates for whichever languages you want
+to parse, to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tree-sitter-highlight = "^0.20"
-tree-sitter-javascript = "0.19"
+tree-sitter-highlight = "0.22.0"
+tree-sitter-javascript = "0.21.3"
 ```
 
 Define the list of highlight names that you will recognize:
@@ -20,15 +21,23 @@ Define the list of highlight names that you will recognize:
 ```rust
 let highlight_names = [
     "attribute",
+    "comment",
     "constant",
-    "function.builtin",
+    "constant.builtin",
+    "constructor",
+    "embedded",
     "function",
+    "function.builtin",
     "keyword",
+    "module",
+    "number",
     "operator",
     "property",
+    "property.builtin",
     "punctuation",
     "punctuation.bracket",
     "punctuation.delimiter",
+    "punctuation.special",
     "string",
     "string.special",
     "tag",
@@ -40,7 +49,8 @@ let highlight_names = [
 ];
 ```
 
-Create a highlighter. You need one of these for each thread that you're using for syntax highlighting:
+Create a highlighter. You need one of these for each thread that you're using for
+syntax highlighting:
 
 ```rust
 use tree_sitter_highlight::Highlighter;
@@ -57,8 +67,9 @@ let javascript_language = tree_sitter_javascript::language();
 
 let mut javascript_config = HighlightConfiguration::new(
     javascript_language,
+    "javascript",
     tree_sitter_javascript::HIGHLIGHT_QUERY,
-    tree_sitter_javascript::INJECTION_QUERY,
+    tree_sitter_javascript::INJECTIONS_QUERY,
     tree_sitter_javascript::LOCALS_QUERY,
 ).unwrap();
 ```
@@ -84,10 +95,10 @@ let highlights = highlighter.highlight(
 for event in highlights {
     match event.unwrap() {
         HighlightEvent::Source {start, end} => {
-            eprintln!("source: {}-{}", start, end);
+            eprintln!("source: {start}-{end}");
         },
         HighlightEvent::HighlightStart(s) => {
-            eprintln!("highlight style started: {:?}", s);
+            eprintln!("highlight style started: {s:?}");
         },
         HighlightEvent::HighlightEnd => {
             eprintln!("highlight style ended");
@@ -96,4 +107,6 @@ for event in highlights {
 }
 ```
 
-The last parameter to `highlight` is a *language injection* callback. This allows other languages to be retrieved when Tree-sitter detects an embedded document (for example, a piece of JavaScript code inside of a `script` tag within HTML).
+The last parameter to `highlight` is a _language injection_ callback. This allows
+other languages to be retrieved when Tree-sitter detects an embedded document
+(for example, a piece of JavaScript code inside a `script` tag within HTML).

@@ -4,16 +4,19 @@ log*.html
 *.xcodeproj
 .vscode
 .cache
+.zig-cache
 
+profile*
 fuzz-results
-
-/tree-sitter.pc
+test/fuzz/out
 test/fixtures/grammars/*
 !test/fixtures/grammars/.gitkeep
-package-lock.json
+
 node_modules
 
 docs/assets/js/tree-sitter.js
+
+/tree-sitter.pc
 
 /target
 *.rs.bk
@@ -21,10 +24,13 @@ docs/assets/js/tree-sitter.js
 *.dylib
 *.so
 *.so.[0-9]*
+*.dll
 *.o
 *.obj
 *.exp
 *.lib
 *.wasm
 .swiftpm
+.build
+build
 zig-*
